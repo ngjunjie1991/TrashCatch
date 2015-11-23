@@ -34,11 +34,13 @@ Usage [optional]:
 #include <tchar.h>
 #include <conio.h>
 #include <winsock2.h>
+#include <math.h>
 
 #include "NatNetTypes.h"
 #include "NatNetClient.h"
 
 #pragma warning( disable : 4996 )
+#define FRAMENUM 5
 
 void _WriteHeader(FILE* fp, sDataDescriptions* pBodyDefs);
 void _WriteFrame(FILE* fp, sFrameOfMocapData* data);
@@ -60,11 +62,25 @@ char szMyIPAddress[128] = "";
 char szServerIPAddress[128] = "";
 
 int analogSamplesPerMocapFrame = 0;
+int sampleCount = 0;
+bool objectInFrame = false;
+bool doneCalc = false;
+MarkerData markerDataArr[FRAMENUM];
+
+
+typedef enum{
+	INITIALIZE,				//initializing connections
+	WAITING,				//waiting for object to enter frame
+	DATA_CAPTURE,			//receiving 5 frames
+	CALCULATE_ENDPOINT,		//calculating landing position of object
+	RESET					//wait for object to leave frame
+} captureState_t;
+
+captureState_t state = INITIALIZE;
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-    int iResult;
-     
+    int iResult;     
     // parse command line args
     if(argc>1)
     {
@@ -161,64 +177,74 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	// Ready to receive marker stream!
 	printf("\nClient is connected to server and listening for data...\n");
-	int c;
+	//int c;
 	bool bExit = false;
-	while(c =_getch())
-	{
-		switch(c)
-		{
-			case 'q':
-				bExit = true;		
-				break;	
-			case 'r':
-				resetClient();
-				break;	
-            case 'p':
-                sServerDescription ServerDescription;
-                memset(&ServerDescription, 0, sizeof(ServerDescription));
-                theClient->GetServerDescription(&ServerDescription);
-                if(!ServerDescription.HostPresent)
-                {
-                    printf("Unable to connect to server. Host not present. Exiting.");
-                    return 1;
-                }
-                break;	
-            case 'f':
-                {
-                    sFrameOfMocapData* pData = theClient->GetLastFrameOfData();
-                    printf("Most Recent Frame: %d", pData->iFrame);
-                }
-                break;	
-            case 'm':	                        // change to multicast
-                iConnectionType = ConnectionType_Multicast;
-                iResult = CreateClient(iConnectionType);
-                if(iResult == ErrorCode_OK)
-                    printf("Client connection type changed to Multicast.\n\n");
-                else
-                    printf("Error changing client connection type to Multicast.\n\n");
-                break;
-            case 'u':	                        // change to unicast
-                iConnectionType = ConnectionType_Unicast;
-                iResult = CreateClient(iConnectionType);
-                if(iResult == ErrorCode_OK)
-                    printf("Client connection type changed to Unicast.\n\n");
-                else
-                    printf("Error changing client connection type to Unicast.\n\n");
-                break;
-            case 'c' :                          // connect
-                iResult = CreateClient(iConnectionType);
-                break;
-            case 'd' :                          // disconnect
-                // note: applies to unicast connections only - indicates to Motive to stop sending packets to that client endpoint
-                iResult = theClient->SendMessageAndWait("Disconnect", &response, &nBytes);
-                if (iResult == ErrorCode_OK)
-                    printf("[SampleClient] Disconnected");
-                break;
-			default:
-				break;
+	while (1) {
+	//*************************************
+	// state transition - run region      *
+	//*************************************
+		if (state == INITIALIZE) {
+			state = WAITING;
 		}
-		if(bExit)
+		else if (state == WAITING) {
+			if (objectInFrame) {
+				printf("STATE: Object has entered frame\n");
+				sampleCount = 0;
+				doneCalc = false;
+				state = DATA_CAPTURE;
+			}
+		}
+		else if (state == DATA_CAPTURE) {
+			if (sampleCount >= FRAMENUM) {
+				printf("STATE: Sample complete\n");
+				state = CALCULATE_ENDPOINT;
+				printf("Reading from array\n");
+				for (int i = 0; i < sampleCount; i++) {
+					printf("Other Marker %d : %3.5f   %3.5f   %3.5f\n",
+						i,
+						markerDataArr[i][0],
+						markerDataArr[i][1],
+						markerDataArr[i][2]);
+				}
+			}
+		}
+		else if (state == CALCULATE_ENDPOINT) {
+			if (!objectInFrame) {
+				printf("STATE: Object has left frame\n");
+				state = WAITING;
+			}
+		}
+	//*****************
+	//* state actions *
+	//*****************
+		double y_d, v_x, v_y, v_z, t_1, t_2, x_f, z_f;
+		const double g = 9.81;
+		switch (state) {
+		case INITIALIZE:
+			sampleCount = 0;
+			objectInFrame = false;
 			break;
+		case WAITING:
+			break;
+		case DATA_CAPTURE:
+			break;
+		case CALCULATE_ENDPOINT:
+			if (!doneCalc) {
+				y_d = -markerDataArr[0][1];
+				v_x = (markerDataArr[FRAMENUM - 1][0] - markerDataArr[0][0]) / ((FRAMENUM - 1)*0.01);
+				v_y = (markerDataArr[FRAMENUM - 1][1] - markerDataArr[0][1]) / ((FRAMENUM - 1)*0.01);
+				v_z = (markerDataArr[FRAMENUM - 1][2] - markerDataArr[0][2]) / ((FRAMENUM - 1)*0.01);
+				t_1 = (v_y + sqrt((v_y*v_y)-2*g*y_d))/g;
+				t_2 = (v_y - sqrt((v_y*v_y) - 2 * g*y_d)) / g;
+				x_f = v_x * t_1 + markerDataArr[0][0];
+				z_f = v_z * t_1 + markerDataArr[0][2];
+				printf("t_1 = %.5f\n t_2 = %.5f\n x_f = %.5f\n z_f = %.5f\n", t_1, t_2, x_f, z_f);
+			}
+			doneCalc = true;
+			break;
+		default:
+			break;
+		}
 	}
 
 	// Done - clean up.
@@ -311,10 +337,29 @@ void __cdecl DataHandler(sFrameOfMocapData* data, void* pUserData)
 		_WriteFrame(fp,data);
 	
     int i=0;
+	
+	//if number of markers > 0, object has entered frame
+	objectInFrame = (data->nOtherMarkers > 0) ? true : false;
 
-    printf("FrameID : %d\n", data->iFrame);
+	//only increment sample count when object is in frame to prevent overflow
+	if (state == DATA_CAPTURE && sampleCount < FRAMENUM) {
+		// Other Markers
+		printf("Other Markers [Count=%d]\n", data->nOtherMarkers);
+		for (i = 0; i < data->nOtherMarkers; i++)
+		{
+			printf("Other Marker %d : %3.5f   %3.5f   %3.5f\n",
+			i,
+			data->OtherMarkers[i][0],
+			data->OtherMarkers[i][1],
+			data->OtherMarkers[i][2]);
+		}
+		memcpy(&markerDataArr[sampleCount], data->OtherMarkers[0], sizeof(data->OtherMarkers[0]));
+		sampleCount++;
+	}
+
+    /*printf("FrameID : %d\n", data->iFrame);
     printf("Timestamp :  %3.2lf\n", data->fTimestamp);
-    printf("Latency :  %3.2lf\n", data->fLatency);
+    printf("Latency :  %3.2lf\n", data->fLatency);*/
     
     // FrameOfMocapData params
     bool bIsRecording = ((data->params & 0x01)!=0);
@@ -331,18 +376,7 @@ void __cdecl DataHandler(sFrameOfMocapData* data, void* pUserData)
 	// decode to friendly string
 	char szTimecode[128] = "";
 	pClient->TimecodeStringify(data->Timecode, data->TimecodeSubframe, szTimecode, 128);
-	printf("Timecode : %s\n", szTimecode);
-
-	// Other Markers
-	printf("Other Markers [Count=%d]\n", data->nOtherMarkers);
-	for(i=0; i < data->nOtherMarkers; i++)
-	{
-		printf("Other Marker %d : %3.2f\t%3.2f\t%3.2f\n",
-			i,
-			data->OtherMarkers[i][0],
-			data->OtherMarkers[i][1],
-			data->OtherMarkers[i][2]);
-	}
+	//printf("Timecode : %s\n", szTimecode);
 }
 
 // MessageHandler receives NatNet error/debug messages
