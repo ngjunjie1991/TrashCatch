@@ -35,6 +35,9 @@ Usage [optional]:
 #include <conio.h>
 #include <winsock2.h>
 #include <math.h>
+#include <string>
+#include <SerialClass.h>
+#include <sstream>
 
 #include "NatNetTypes.h"
 #include "NatNetClient.h"
@@ -49,6 +52,8 @@ void __cdecl DataHandler(sFrameOfMocapData* data, void* pUserData);		// receives
 void __cdecl MessageHandler(int msgType, char* msg);		            // receives NatNet error mesages
 void resetClient();
 int CreateClient(int iConnectionType);
+bool inverseKinematics(float x, float y);
+void sendAngles(char *angles, Serial *SP);
 
 unsigned int MyServersDataPort = 3130;
 unsigned int MyServersCommandPort = 3131;
@@ -65,8 +70,19 @@ int analogSamplesPerMocapFrame = 0;
 int sampleCount = 0;
 bool objectInFrame = false;
 bool doneCalc = false;
+bool isDebug = true;
 MarkerData markerDataArr[FRAMENUM];
 
+// Rig constants 
+const float l1 = 0.28;
+const float l5 = 0.62;
+const float l2 = 0.6;
+const float l3 = l2;
+const float l4 = l1;
+
+const float pi = 3.142;
+
+char motors[7] = "";
 
 typedef enum{
 	INITIALIZE,				//initializing connections
@@ -80,7 +96,12 @@ captureState_t state = INITIALIZE;
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-    int iResult;     
+	Serial* SP = new Serial("\\\\.\\COM3");    // adjust as needed
+
+	if (SP->IsConnected())
+		printf("We're connected");
+
+	int iResult;     
     // parse command line args
     if(argc>1)
     {
@@ -177,7 +198,6 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	// Ready to receive marker stream!
 	printf("\nClient is connected to server and listening for data...\n");
-	//int c;
 	bool bExit = false;
 	while (1) {
 	//*************************************
@@ -188,7 +208,9 @@ int _tmain(int argc, _TCHAR* argv[])
 		}
 		else if (state == WAITING) {
 			if (objectInFrame) {
-				printf("STATE: Object has entered frame\n");
+				if (isDebug) {
+					printf("STATE: Object has entered frame\n");
+				}
 				sampleCount = 0;
 				doneCalc = false;
 				state = DATA_CAPTURE;
@@ -196,21 +218,27 @@ int _tmain(int argc, _TCHAR* argv[])
 		}
 		else if (state == DATA_CAPTURE) {
 			if (sampleCount >= FRAMENUM) {
-				printf("STATE: Sample complete\n");
+				if (isDebug) {
+					printf("STATE: Sample complete\n");
+				}
 				state = CALCULATE_ENDPOINT;
-				printf("Reading from array\n");
-				for (int i = 0; i < sampleCount; i++) {
-					printf("Other Marker %d : %3.5f   %3.5f   %3.5f\n",
-						i,
-						markerDataArr[i][0],
-						markerDataArr[i][1],
-						markerDataArr[i][2]);
+				if (isDebug) {
+					printf("Reading from array\n");
+					for (int i = 0; i < sampleCount; i++) {
+						printf("Other Marker %d : %3.5f   %3.5f   %3.5f\n",
+							i,
+							markerDataArr[i][0],
+							markerDataArr[i][1],
+							markerDataArr[i][2]);
+					}
 				}
 			}
 		}
 		else if (state == CALCULATE_ENDPOINT) {
 			if (!objectInFrame) {
-				printf("STATE: Object has left frame\n");
+				if (isDebug) {
+					printf("STATE: Object has left frame\n");
+				}
 				state = WAITING;
 			}
 		}
@@ -230,7 +258,7 @@ int _tmain(int argc, _TCHAR* argv[])
 			break;
 		case CALCULATE_ENDPOINT:
 			if (!doneCalc) {
-				y_d = -markerDataArr[0][1];
+				y_d = 0.076-markerDataArr[0][1];
 				v_x = (markerDataArr[FRAMENUM - 1][0] - markerDataArr[0][0]) / ((FRAMENUM - 1)*0.01);
 				v_y = (markerDataArr[FRAMENUM - 1][1] - markerDataArr[0][1]) / ((FRAMENUM - 1)*0.01);
 				v_z = (markerDataArr[FRAMENUM - 1][2] - markerDataArr[0][2]) / ((FRAMENUM - 1)*0.01);
@@ -238,7 +266,15 @@ int _tmain(int argc, _TCHAR* argv[])
 				t_2 = (v_y - sqrt((v_y*v_y) - 2 * g*y_d)) / g;
 				x_f = v_x * t_1 + markerDataArr[0][0];
 				z_f = v_z * t_1 + markerDataArr[0][2];
-				printf("t_1 = %.5f\n t_2 = %.5f\n x_f = %.5f\n z_f = %.5f\n", t_1, t_2, x_f, z_f);
+				if (isDebug) {
+					printf("t_1 = %.5f\n t_2 = %.5f\n x_f = %.5f\n z_f = %.5f\n", t_1, t_2, x_f, z_f);
+				}
+				//Calculate IK
+				if (inverseKinematics(x_f, -z_f)){
+					//Send to arduino
+					sendAngles(motors, SP);
+					sendAngles("095095", SP);
+				}
 			}
 			doneCalc = true;
 			break;
@@ -448,3 +484,107 @@ void resetClient()
 
 }
 
+bool inverseKinematics(float x, float y)
+{
+	float E1, F1, G1, E4, F4, G4, t11, t12, t41, t42, angle1_1, angle1_2, angle4_1, angle4_2;
+	int motor1, motor2;
+	std::string motor1string, motor2string, motorString;
+	char buffer2[4];
+
+	E1 = -2 * l1*x;
+	F1 = -2 * l1*y;
+	G1 = pow(l1, 2) - pow(l2, 2) + pow(x, 2) + pow(y, 2);
+	E4 = 2 * l4*(-x + l5);
+	F4 = 2 * l4*(-y);
+	G4 = pow(l5, 2) + pow(l4, 2) - pow(l3, 2) + pow(x, 2) + pow(y, 2) - 2 * l5*x;
+	t11 = -F1 + sqrt(pow(E1, 2) + pow(F1, 2) - pow(G1, 2));
+	t11 = t11 / (G1 - E1);
+	t12 = -F1 - sqrt(pow(E1, 2) + pow(F1, 2) - pow(G1, 2));
+	t12 = t12 / (G1 - E1);
+	t41 = -F4 + sqrt(pow(E4, 2) + pow(F4, 2) - pow(G4, 2));
+	t41 = t41 / (G4 - E4);
+	t42 = -F4 - sqrt(pow(E4, 2) + pow(F4, 2) - pow(G4, 2));
+	t42 = t42 / (G4 - E4);
+
+	angle1_1 = 2 * atan2(t11, 1);
+	angle1_1 = 180 * angle1_1 / pi;
+
+	angle1_2 = 2 * atan2(t12, 1);
+	angle1_2 = 180 * angle1_2 / pi;
+
+	angle4_1 = 2 * atan2(t41, 1);
+	angle4_1 = 180 * angle4_1 / pi;
+
+	angle4_2 = 2 * atan2(t42, 1);
+	angle4_2 = 180 * angle4_2 / pi;
+
+
+	if (angle1_1 >= 30 && angle1_1 <= 160)
+		motor1 = int(angle1_1);
+	else if (angle1_2 >= 30 && angle1_2 <= 160)
+		motor1 = int(angle1_2);
+	else
+		motor1 = 0;
+
+	if (angle4_1 >= 30 && angle4_1 <= 160)
+		motor2 = int(angle4_1);
+	else if (angle4_2 >= 30 && angle4_2 <= 160)
+		motor2 = int(angle4_2);
+	else
+		motor2 = 0;
+	
+	motor1string = std::to_string(motor1);
+	motor2string = std::to_string(motor2);
+
+	int temp_length = motor1string.length();
+
+	for (int i = 0; i < 3 - temp_length; i++) {
+		motor1string = "0" + motor1string;
+	}
+
+	temp_length = motor2string.length();
+
+	for (int i = 0; i < 3 - temp_length; i++) {
+		motor2string = "0" + motor2string;
+	}
+
+	motorString = motor1string + motor2string;
+	strcpy(motors, motorString.c_str());
+	
+	/*itoa(motor1, motors, 10);
+	itoa(motor2, buffer2, 10);
+	strncat(motors, buffer2, 4);*/
+	if (isDebug) {
+		printf("angle for Servo1 = %d \n angle for Servo 2 = %d \n", motor1, motor2);
+		printf("Angles: %f.2 %f.2 %f.2 %f.2\n", angle1_1, angle1_2, angle4_1, angle4_2);
+	}
+	
+	if (motor1 == 0 || motor2 == 0) 
+		return false;
+	return true;
+}
+
+void sendAngles(char *angles, Serial *SP)
+{
+	//char incomingData[7] = "";   // don't forget to pre-allocate memory
+	int dataLength = 7;
+	//int readResult = 0;
+	int writeResult = 0;
+
+	writeResult = SP->WriteData(angles, dataLength);
+	if (true) {
+		printf("String angles: %s\n", angles);
+	}
+
+	//writeResult = SP->WriteInt(outgoingData, dataLength);
+	//printf("Bytes written: %i\n", writeResult);
+	Sleep(2000);
+	//readResult = SP->ReadData(incomingData, dataLength);
+	//printf("Bytes read: (-1 means no data available) %i\n", readResult);
+
+	//std::string test(incomingData);
+
+	//printf("%s\n", incomingData);
+	//test = "";
+
+}
